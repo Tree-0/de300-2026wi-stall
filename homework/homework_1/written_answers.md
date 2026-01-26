@@ -6,6 +6,7 @@ As a note, much of my reasoning is also in the jupyter notebook containing my co
 
 ## 1. Imputation choices
 - `CARRIER`
+    - Only North American Airlines had missing values.
     - Some `CARRIER` values for North American Airlines were NaN, some were "NA". "NA" is presumably the correct value, so I chose to impute the missing columns with a constant value.
 
 - `CARRIER_NAME`
