@@ -29,15 +29,15 @@ Before launching the EC2 instance, collect these details:
 
 ```bash
 # RDS Details (from AWS Console → RDS)
-RDS_HOST=your-instance.c9akciq32.us-east-1.rds.amazonaws.com
+RDS_HOST=http://database-1.chm317to06o1.us-east-1.rds.amazonaws.com/
 RDS_PORT=5432
-RDS_DATABASE=newsfeed
+RDS_DATABASE=postgres
 RDS_USER=postgres
-RDS_PASSWORD=your-password
+RDS_PASSWORD=password=$(aws secretsmanager get-secret-value --secret-id 'arn:aws:secretsmanager:us-east-1:549787090008:secret:rds!db-6323faa7-77d3-4952-af08-bcd6d623f642-g3XgW6' --query SecretString --output text | jq -r '.password')
 
 # S3 Details
-S3_BUCKET=your-bucket-name
-S3_DUMP_KEY=musicbrainz/listenbrainz-listens-dump-2428-20260213-000003-incremental.tar.zst
+S3_BUCKET=stall-munezero-final-project
+S3_DUMP_KEY=listenbrainz/incremental/listenbrainz-listens-dump-2400-20260118-000003-incremental.tar.zst
 
 # Your AWS Region
 AWS_REGION=us-east-1
