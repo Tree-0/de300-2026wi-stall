@@ -1,0 +1,7 @@
+numpy
+torch
+torch.nn.functional
+transformers.AutoTokenizer,
+transformers.AutoModel,
+faiss
+pandas
