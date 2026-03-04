@@ -1,6 +1,10 @@
 numpy
-torch
-torch.nn.functional
+
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.3.0+cpu
+torchvision==0.18.0+cpu
+torchaudio==2.3.0+cpu
+
 transformers.AutoTokenizer,
 transformers.AutoModel,
 faiss
