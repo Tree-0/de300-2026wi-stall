@@ -20,46 +20,51 @@ from airflow.operators.python import PythonOperator
 """
 HW3 DAG: MovieLens 1M BERT-based recommendations on MWAA.
 
-This DAG assumes that the following one-time/offline artifacts already exist
-in the MWAA S3 bucket:
-- ml-1m/movies.dat
-- ml-1m/users.dat
-- ml-1m/ratings_956620800-965347200   (partition I)
-- ml-1m/ratings_965347200-973036800   (partition II)
-- ml-1m/ratings_973036800-975196800   (partition III)
-- ml-1m/ratings_975196800-1798761600  (partition IV)
-- ml-1m/item_emb_full.index           (Faiss index of movie BERT embeddings)
+Our DAG assumes that the following one-time/offline artifacts already exist
+in the MWAA S3 bucket under the hw3/ prefix (e.g. hw3/ml-1m/...):
+- hw3/ml-1m/movies.dat
+- hw3/ml-1m/users.dat
+- hw3/ml-1m/ratings_956620800-965347200   (partition I)
+- hw3/ml-1m/ratings_965347200-973036800   (partition II)
+- hw3/ml-1m/ratings_973036800-975196800   (partition III)
+- hw3/ml-1m/ratings_975196800-1798761600  (partition IV)
+- hw3/ml-1m/item_emb_full.index           (Faiss index of movie BERT embeddings)
 
 The DAG reuses those movie embeddings and, at each of four iterations,
 combines observation partitions up to that point, samples 30% of users,
 and writes recommendations for a cold user and a top user to S3 under
-the `recommendations/` prefix without overwriting previous iterations.
+hw3/recommendations/ without overwriting previous iterations.
 """
 
-# ---------------------------------------------------------------------------
 # Configuration
-# ---------------------------------------------------------------------------
 
-# Bucket that backs your MWAA environment (already created per instructions)
+# Bucket that backs MWAA environment (already created per instructions)
 OUTPUT_BUCKET = os.getenv("HW3_MWAA_BUCKET", "stall-munezero-mwaa")
+
+# All HW3 data lives under this prefix in the bucket (hw3/ with ml-1m/ and recommendations/ inside)
+HW3_S3_PREFIX = "hw3"
 
 # Local working directory inside the MWAA worker
 MOVIELENS_DIR = Path("/tmp/ml-1m")
 MOVIELENS_DIR.mkdir(parents=True, exist_ok=True)
 
-# S3 keys for artifacts prepared offline
-MOVIES_KEY = "ml-1m/movies.dat"
-USERS_KEY = "ml-1m/users.dat"
+# S3 keys for artifacts prepared offline (under hw3/)
+MOVIES_KEY = f"{HW3_S3_PREFIX}/ml-1m/movies.dat"
+USERS_KEY = f"{HW3_S3_PREFIX}/ml-1m/users.dat"
 RATINGS_PART_KEYS: List[str] = [
-    "ml-1m/ratings_956620800-965347200",
-    "ml-1m/ratings_965347200-973036800",
-    "ml-1m/ratings_973036800-975196800",
-    "ml-1m/ratings_975196800-1798761600",
+    f"{HW3_S3_PREFIX}/ml-1m/ratings_956620800-965347200",
+    f"{HW3_S3_PREFIX}/ml-1m/ratings_965347200-973036800",
+    f"{HW3_S3_PREFIX}/ml-1m/ratings_973036800-975196800",
+    f"{HW3_S3_PREFIX}/ml-1m/ratings_975196800-1798761600",
 ]
-FAISS_INDEX_KEY = "ml-1m/item_emb_full.index"
+FAISS_INDEX_KEY = f"{HW3_S3_PREFIX}/ml-1m/item_emb_full.index"
 
-# Four logical iterations at 0h, 10h, 20h, 30h.
+# Four logical iterations; spacing controlled by ITERATION_INTERVAL_MINUTES.
 N_ITERATIONS = 4
+
+# For testing, run an iteration every 10 minutes. You can later change this to
+# 60 (hourly), 600 (every 10 hours), etc., as long as you update the schedule.
+ITERATION_INTERVAL_MINUTES = 10
 
 
 def _get_s3_client():
@@ -293,12 +298,26 @@ def _summarize_user_row(
     return summary
 
 
-def run_recommendation_iteration(iter_idx: int, **context) -> None:
+def run_recommendation_iteration(**context) -> None:
     """
-    Core callable for each of the four iterations (0h, 10h, 20h, 30h).
+    Core callable for a single DAG run.
+
+    Each run corresponds to (at most) one logical iteration:
+    0h, 10h, 20h, 30h. The iteration index is inferred from the
+    logical run time and only runs up to N_ITERATIONS times.
     """
+    logical_date = context.get("logical_date") or context.get("execution_date")
+    if logical_date is None:
+        raise ValueError("logical_date/execution_date missing from context")
+
+    # Determine which iteration this run represents based on minutes since start.
+    delta_minutes = (logical_date - DAG_START).total_seconds() / 60.0
+    iter_idx = int(delta_minutes // ITERATION_INTERVAL_MINUTES)
+
     if iter_idx < 0 or iter_idx >= N_ITERATIONS:
-        raise ValueError(f"iter_idx must be between 0 and {N_ITERATIONS - 1}, got {iter_idx}")
+        # After the 4th logical iteration, do nothing (no-op run).
+        print(f"Skipping run at {logical_date}: iter_idx={iter_idx} outside [0, {N_ITERATIONS - 1}]")
+        return
 
     s3_client = _get_s3_client()
     movies, users = _load_movies_and_users(s3_client)
@@ -326,63 +345,37 @@ def run_recommendation_iteration(iter_idx: int, **context) -> None:
     local_out = MOVIELENS_DIR / f"recs_iter{iter_idx}_{logical_date}.csv"
     df.to_csv(local_out, index=False)
 
-    s3_key = f"recommendations/recs_iter{iter_idx}_{logical_date}.csv"
+    s3_key = f"{HW3_S3_PREFIX}/recommendations/recs_iter{iter_idx}_{logical_date}.csv"
     s3_client.upload_file(str(local_out), OUTPUT_BUCKET, s3_key)
 
     # Also log basic info for debugging
     print(json.dumps({"s3_bucket": OUTPUT_BUCKET, "s3_key": s3_key, "rows": len(df)}))
 
 
-# ---------------------------------------------------------------------------
-# DAG definition
-# ---------------------------------------------------------------------------
+# DAG Definition
 
-start = pendulum.now("UTC")
-end = start.add(hours=48)
+DAG_START = pendulum.now("UTC")
+DAG_END = DAG_START.add(hours=48)
 
 default_args = {
     "owner": "de300",
     "depends_on_past": False,
-    "start_date": start,
+    "start_date": DAG_START,
     "retries": 1,
 }
 
 with DAG(
-    dag_id="hw3_movielens_mwaa_recommendations",
+    dag_id="hw3_stall_munezero_ml1m_recommendations",
     default_args=default_args,
-    schedule_interval="0 */10 * * *",  # every 10 hours
-    end_date=end,
+    schedule_interval="*/10 * * * *",  # every 10 minutes (for testing)
+    end_date=DAG_END,
     catchup=False,
     max_active_runs=1,
     dagrun_timeout=timedelta(hours=48),
 ) as dag:
-    iter0 = PythonOperator(
-        task_id="iteration_0h",
+    run_iteration = PythonOperator(
+        task_id="run_recommendation_iteration",
         python_callable=run_recommendation_iteration,
-        op_kwargs={"iter_idx": 0},
         provide_context=True,
     )
-
-    iter1 = PythonOperator(
-        task_id="iteration_10h",
-        python_callable=run_recommendation_iteration,
-        op_kwargs={"iter_idx": 1},
-        provide_context=True,
-    )
-
-    iter2 = PythonOperator(
-        task_id="iteration_20h",
-        python_callable=run_recommendation_iteration,
-        op_kwargs={"iter_idx": 2},
-        provide_context=True,
-    )
-
-    iter3 = PythonOperator(
-        task_id="iteration_30h",
-        python_callable=run_recommendation_iteration,
-        op_kwargs={"iter_idx": 3},
-        provide_context=True,
-    )
-
-    iter0 >> iter1 >> iter2 >> iter3
 
