@@ -11,6 +11,9 @@ from dotenv import load_dotenv
 _SECRET_ARN = "arn:aws:secretsmanager:us-east-1:549787090008:secret:rds!db-6323faa7-77d3-4952-af08-bcd6d623f642-g3XgW6"
 _AWS_REGION = "us-east-1"
 
+# ---------------------------------------------------------------------------
+# Credentials / Connections
+# ---------------------------------------------------------------------------
 
 def load_db_credentials(env_path: Path | None = None) -> dict[str, str]:
     """
@@ -81,6 +84,61 @@ def _test_db_connection():
         if conn:
             conn.close()
 
+# ---------------------------------------------------------------------------
+# S3 helpers
+# ---------------------------------------------------------------------------
+
+def get_s3_client(region: str | None = None):
+    """Return a boto3 S3 client using the default credential chain."""
+    import boto3
+    return boto3.client("s3", region_name=region or _AWS_REGION)
+
+
+def list_s3_artifacts(bucket: str, prefix: str, s3_client=None) -> list[str]:
+    """
+    List all object keys under *prefix* in *bucket*.
+
+    Uses the paginator so it works for >1 000 objects.
+    Returns a list of full S3 keys (strings).
+    """
+    if s3_client is None:
+        s3_client = get_s3_client()
+
+    paginator = s3_client.get_paginator("list_objects_v2")
+    keys: list[str] = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+    return keys
+
+
+def download_s3_dump(bucket: str, key: str, local_dir: Path | str | None = None,
+                     s3_client=None) -> Path:
+    """
+    Download an S3 object to a local directory and return the local Path.
+
+    *local_dir* defaults to ``./tmp_listenbrainz``.  The directory is created
+    if it doesn't exist.  Cleanup is the caller's responsibility.
+    """
+    if s3_client is None:
+        s3_client = get_s3_client()
+
+    if local_dir is None:
+        local_dir = Path("./tmp_listenbrainz")
+    local_dir = Path(local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = key.rsplit("/", 1)[-1]
+    local_path = local_dir / filename
+
+    print(f"Downloading s3://{bucket}/{key} → {local_path} ...")
+    s3_client.download_file(bucket, key, str(local_path))
+    print(f"Done ({local_path.stat().st_size / 1e6:.1f} MB)")
+    return local_path
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     _test_db_connection()
