@@ -21,7 +21,7 @@ s3://stall-munezero-final-project/
 
 ## source code:
 `sm_hw3_dag.py` (already in our airflow)
-the `requirements.txt` already in our bucket
+the `requirements.txt` that is already in our bucket
 
 ## Generative AI
 
@@ -43,7 +43,7 @@ Combine the updated observations with the previous ones.
 "
 ``` 
 
-We had an absurd amount of problems with our requirements.txt, eventually requiring us to completely scrap dags and rebuild them with a different set of requirements. total waste of time. 
+We had an absurd amount of problems with our requirements.txt, eventually requiring us to completely scrap dags and rebuild them with a different set of requirements. total waste of time. We probably should have just spent this time on our Final Project instead of the homework?
 
 ```
 Please rebuild this pipeline without the need for faiss as one of the module requirements. 
