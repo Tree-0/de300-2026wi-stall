@@ -1,4 +1,6 @@
-# put this file into airflow
+# initial attempt on airflow 2.10.3
+# NOT THE FINAL ATTEMPT
+
 from __future__ import annotations
 
 import json
@@ -7,14 +9,9 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Dict, List
 
-import boto3
-import faiss  # type: ignore
-import numpy as np
-import pandas as pd
 import pendulum
-import torch
-import torch.nn.functional as F
 from airflow import DAG
+from airflow.exceptions import AirflowSkipException
 from airflow.operators.python import PythonOperator
 
 """
@@ -69,8 +66,56 @@ ITERATION_INTERVAL_MINUTES = 10
 
 def _get_s3_client():
     """Use instance/IAM credentials on MWAA."""
+    import boto3
+
     session = boto3.Session()
     return session.client("s3")
+
+
+def _determine_next_iter_idx(s3_client) -> int:
+    """
+    Inspect existing recommendation files in S3 to determine the next
+    iteration index to run. This makes iteration assignment robust to
+    manual runs and worker timing.
+
+    Returns an integer in [0, N_ITERATIONS-1], or raises AirflowSkipException
+    if all iterations have already been produced.
+    """
+    from botocore.exceptions import ClientError
+
+    prefix = f"{HW3_S3_PREFIX}/recommendations/recs_iter"
+    try:
+        resp = s3_client.list_objects_v2(Bucket=OUTPUT_BUCKET, Prefix=prefix)
+    except ClientError as exc:
+        # If listing fails for some reason, fall back to starting at 0
+        print(f"Warning: failed to list S3 objects for prefix {prefix}: {exc}")
+        return 0
+
+    existing_iters = []
+    for obj in resp.get("Contents", []):
+        key = obj["Key"]
+        # Expect keys like hw3/recommendations/recs_iter{idx}_{ds}.csv
+        if "recs_iter" in key:
+            try:
+                after = key.split("recs_iter", 1)[1]
+                idx_str = after.split("_", 1)[0]
+                existing_iters.append(int(idx_str))
+            except (IndexError, ValueError):
+                continue
+
+    if not existing_iters:
+        next_idx = 0
+    else:
+        next_idx = max(existing_iters) + 1
+
+    if next_idx >= N_ITERATIONS:
+        msg = f"All {N_ITERATIONS} iterations already completed; nothing left to run."
+        print(msg)
+        from airflow.exceptions import AirflowSkipException as _Skip
+
+        raise _Skip(msg)
+
+    return next_idx
 
 
 def _download_from_s3(s3_client, bucket: str, key: str, local_path: Path) -> Path:
@@ -79,7 +124,9 @@ def _download_from_s3(s3_client, bucket: str, key: str, local_path: Path) -> Pat
     return local_path
 
 
-def _load_movies_and_users(s3_client) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _load_movies_and_users(s3_client) -> tuple["pd.DataFrame", "pd.DataFrame"]:
+    import pandas as pd
+
     movies_path = _download_from_s3(
         s3_client, OUTPUT_BUCKET, MOVIES_KEY, MOVIELENS_DIR / "movies.dat"
     )
@@ -106,8 +153,10 @@ def _load_movies_and_users(s3_client) -> tuple[pd.DataFrame, pd.DataFrame]:
     return movies, users
 
 
-def _load_ratings_partitions(s3_client, up_to_iter: int) -> pd.DataFrame:
+def _load_ratings_partitions(s3_client, up_to_iter: int) -> "pd.DataFrame":
     """Load and combine rating partitions up to and including `up_to_iter`."""
+    import pandas as pd
+
     dfs: List[pd.DataFrame] = []
     for idx in range(up_to_iter + 1):
         key = RATINGS_PART_KEYS[idx]
@@ -124,7 +173,9 @@ def _load_ratings_partitions(s3_client, up_to_iter: int) -> pd.DataFrame:
     return ratings
 
 
-def _load_faiss_index(s3_client) -> faiss.IndexFlatIP:
+def _load_faiss_index(s3_client) -> "faiss.IndexFlatIP":
+    import faiss
+
     index_path = _download_from_s3(
         s3_client, OUTPUT_BUCKET, FAISS_INDEX_KEY, MOVIELENS_DIR / "item_emb_full.index"
     )
@@ -144,6 +195,10 @@ def _get_bert_pretrained():
 
 
 def _encode_single_text(tokenizer, encoder, device: str, text: str, max_len: int = 128) -> np.ndarray:
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+
     if not text:
         return None
     with torch.no_grad():
@@ -222,6 +277,8 @@ def _recommend_for_user(
 
 
 def _sample_users(ratings: pd.DataFrame, sample_pct: float = 30.0) -> pd.DataFrame:
+    import pandas as pd
+
     user_ids = ratings["user_id"].unique()
     users_df = pd.DataFrame({"user_id": user_ids})
     if not 0 < sample_pct <= 100:
@@ -233,6 +290,8 @@ def _sample_users(ratings: pd.DataFrame, sample_pct: float = 30.0) -> pd.DataFra
 def _build_positive_events(
     ratings: pd.DataFrame, sampled_users: pd.DataFrame
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    import pandas as pd
+
     ratings = ratings.copy()
     ratings["timestamp"] = pd.to_datetime(ratings["timestamp"], unit="s")
     user_subset = set(sampled_users["user_id"].tolist())
@@ -298,30 +357,60 @@ def _summarize_user_row(
     return summary
 
 
-def run_recommendation_iteration(**context) -> None:
+def combine_observations(**context) -> Dict:
     """
-    Core callable for a single DAG run.
+    Task 1: determine iteration index and combine rating partitions
+    up to and including that iteration.
 
-    Each run corresponds to (at most) one logical iteration:
-    0h, 10h, 20h, 30h. The iteration index is inferred from the
-    logical run time and only runs up to N_ITERATIONS times.
+    Returns XCom payload with iter_idx and local file paths to the
+    combined ratings, movies, and users data.
     """
-    logical_date = context.get("logical_date") or context.get("execution_date")
-    if logical_date is None:
-        raise ValueError("logical_date/execution_date missing from context")
-
-    # Determine which iteration this run represents based on minutes since start.
-    delta_minutes = (logical_date - DAG_START).total_seconds() / 60.0
-    iter_idx = int(delta_minutes // ITERATION_INTERVAL_MINUTES)
-
-    if iter_idx < 0 or iter_idx >= N_ITERATIONS:
-        # After the 4th logical iteration, do nothing (no-op run).
-        print(f"Skipping run at {logical_date}: iter_idx={iter_idx} outside [0, {N_ITERATIONS - 1}]")
-        return
-
     s3_client = _get_s3_client()
+    iter_idx = _determine_next_iter_idx(s3_client)
+
+    logical_ds_nodash = context["ds_nodash"]
     movies, users = _load_movies_and_users(s3_client)
     ratings = _load_ratings_partitions(s3_client, up_to_iter=iter_idx)
+
+    movies_path = MOVIELENS_DIR / f"movies_iter{iter_idx}.csv"
+    users_path = MOVIELENS_DIR / f"users_iter{iter_idx}.csv"
+    ratings_path = MOVIELENS_DIR / f"ratings_combined_iter{iter_idx}.csv"
+
+    movies.to_csv(movies_path, index=False)
+    users.to_csv(users_path, index=False)
+    ratings.to_csv(ratings_path, index=False)
+
+    return {
+        "iter_idx": iter_idx,
+        "logical_ds_nodash": logical_ds_nodash,
+        "movies_path": str(movies_path),
+        "users_path": str(users_path),
+        "ratings_path": str(ratings_path),
+    }
+
+
+def generate_recommendations(**context) -> Dict:
+    """
+    Task 2: using the cumulative observations, generate recommendations
+    for a cold user and a top user, and save them locally.
+    """
+    import pandas as pd
+
+    ti = context["ti"]
+    payload = ti.xcom_pull(task_ids="combine_observations")
+    if not payload:
+        msg = "No combined observations found in XCom from combine_observations."
+        print(msg)
+        raise AirflowSkipException(msg)
+
+    iter_idx = int(payload["iter_idx"])
+    logical_ds_nodash = payload["logical_ds_nodash"]
+
+    movies = pd.read_csv(payload["movies_path"])
+    users = pd.read_csv(payload["users_path"])
+    ratings = pd.read_csv(payload["ratings_path"])
+
+    s3_client = _get_s3_client()
     index = _load_faiss_index(s3_client)
     tokenizer, encoder, device = _get_bert_pretrained()
 
@@ -340,16 +429,41 @@ def run_recommendation_iteration(**context) -> None:
     top_summary = _summarize_user_row(top_user, "top", top_rec, users)
     df = pd.DataFrame([cold_summary, top_summary])
 
-    # Use iteration index and logical execution date in filename to avoid overwrites
-    logical_date = context["ds_nodash"]
-    local_out = MOVIELENS_DIR / f"recs_iter{iter_idx}_{logical_date}.csv"
+    local_out = MOVIELENS_DIR / f"recs_iter{iter_idx}_{logical_ds_nodash}.csv"
     df.to_csv(local_out, index=False)
 
-    s3_key = f"{HW3_S3_PREFIX}/recommendations/recs_iter{iter_idx}_{logical_date}.csv"
-    s3_client.upload_file(str(local_out), OUTPUT_BUCKET, s3_key)
+    return {
+        "iter_idx": iter_idx,
+        "logical_ds_nodash": logical_ds_nodash,
+        "recs_path": str(local_out),
+        "rows": len(df),
+    }
 
-    # Also log basic info for debugging
-    print(json.dumps({"s3_bucket": OUTPUT_BUCKET, "s3_key": s3_key, "rows": len(df)}))
+
+def upload_recommendations(**context) -> None:
+    """
+    Task 3: upload the locally saved recommendations file to S3 under
+    hw3/recommendations/ with a non-overwriting naming scheme.
+    """
+    ti = context["ti"]
+    payload = ti.xcom_pull(task_ids="generate_recommendations")
+    if not payload:
+        msg = "No recommendations found in XCom from generate_recommendations."
+        print(msg)
+        raise AirflowSkipException(msg)
+
+    iter_idx = int(payload["iter_idx"])
+    logical_ds_nodash = payload["logical_ds_nodash"]
+    recs_path = Path(payload["recs_path"])
+
+    if not recs_path.exists():
+        raise FileNotFoundError(f"Recommendations file not found at {recs_path}")
+
+    s3_client = _get_s3_client()
+    s3_key = f"{HW3_S3_PREFIX}/recommendations/recs_iter{iter_idx}_{logical_ds_nodash}.csv"
+    s3_client.upload_file(str(recs_path), OUTPUT_BUCKET, s3_key)
+
+    print(json.dumps({"s3_bucket": OUTPUT_BUCKET, "s3_key": s3_key, "rows": payload.get("rows")}))
 
 
 # DAG Definition
@@ -365,7 +479,7 @@ default_args = {
 }
 
 with DAG(
-    dag_id="hw3_stall_munezero_ml1m_recommendations",
+    dag_id="hw3_stall_munezero_recs_dag",
     default_args=default_args,
     schedule_interval="*/10 * * * *",  # every 10 minutes (for testing)
     end_date=DAG_END,
@@ -373,9 +487,23 @@ with DAG(
     max_active_runs=1,
     dagrun_timeout=timedelta(hours=48),
 ) as dag:
-    run_iteration = PythonOperator(
-        task_id="run_recommendation_iteration",
-        python_callable=run_recommendation_iteration,
+    combine_task = PythonOperator(
+        task_id="combine_observations",
+        python_callable=combine_observations,
         provide_context=True,
     )
+
+    recommend_task = PythonOperator(
+        task_id="generate_recommendations",
+        python_callable=generate_recommendations,
+        provide_context=True,
+    )
+
+    upload_task = PythonOperator(
+        task_id="upload_recommendations",
+        python_callable=upload_recommendations,
+        provide_context=True,
+    )
+
+    combine_task >> recommend_task >> upload_task
 
