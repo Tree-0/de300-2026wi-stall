@@ -11,7 +11,7 @@ AWS_DEFAULT_REGION=us-east-1
 PGPORT=5433
 PGHOST="127.0.0.1"
 PGDATABASE=postgres
-PGPASSWORD="EkWcY<OQ|7u|4u3[zndr2-oba?cE"
+PGPASSWORD=""
 ```
 
 Connecting to remote rds database via. EC2 instance: <br>
