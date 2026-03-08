@@ -15,7 +15,7 @@ _AWS_REGION = "us-east-1"
 # Credentials / Connections
 # ---------------------------------------------------------------------------
 
-def load_db_credentials(env_path: Path | None = None) -> dict[str, str]:
+def load_db_credentials(env_path: Path | None = None) -> dict[str, str | int]:
     """
     Load Postgres credentials from a .env file (and optionally AWS Secrets Manager).
 
@@ -28,18 +28,46 @@ def load_db_credentials(env_path: Path | None = None) -> dict[str, str]:
         env_path = Path(__file__).resolve().parent.parent / ".env"
     load_dotenv(dotenv_path=env_path, override=True)
 
-    password = os.getenv("PGPASSWORD")
+    env_host = os.getenv("PGHOST")
+    env_port = os.getenv("PGPORT")
+    env_dbname = os.getenv("PGDATABASE")
+    env_user = os.getenv("PGUSER")
+    env_password = os.getenv("PGPASSWORD")
+
+    secret: dict = {}
+    if not env_password or not env_user:
+        try:
+            import boto3
+
+            sm = boto3.client("secretsmanager", region_name=_AWS_REGION)
+            secret_str = sm.get_secret_value(SecretId=_SECRET_ARN)["SecretString"]
+            secret = json.loads(secret_str)
+        except Exception:
+            # Fall back to env/default values when secrets access is unavailable.
+            secret = {}
+
+    host = env_host or secret.get("host") or "127.0.0.1"
+
+    port_raw = env_port or secret.get("port") or "5433"
+    try:
+        port = int(port_raw)
+    except (TypeError, ValueError):
+        port = 5433
+
+    dbname = env_dbname or secret.get("dbname") or secret.get("database") or "postgres"
+    user = env_user or secret.get("username") or secret.get("user") or "postgres"
+    password = env_password or secret.get("password")
+
     if not password:
-        import boto3
-        sm = boto3.client("secretsmanager", region_name=_AWS_REGION)
-        secret_str = sm.get_secret_value(SecretId=_SECRET_ARN)["SecretString"]
-        password = json.loads(secret_str)["password"]
+        raise RuntimeError(
+            "Database password not found. Set PGPASSWORD in .env or allow Secrets Manager access."
+        )
 
     return {
-        "host": os.getenv("PGHOST") or "127.0.0.1",
-        "port": int(os.getenv("PGPORT")) or 5433,
-        "dbname": os.getenv("PGDATABASE") or "postgres",
-        "user": os.getenv("PGUSER") or "postgres",
+        "host": host,
+        "port": port,
+        "dbname": dbname,
+        "user": user,
         "password": password,
         "sslrootcert": str(Path.home() / "rds-global-bundle.pem"),
     }

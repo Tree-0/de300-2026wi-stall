@@ -1,13 +1,5 @@
-# outdated requirements.txt; I believe this is not the one we ultimately use on s3
---extra-index-url https://download.pytorch.org/whl/cpu
---constraint https://raw.githubusercontent.com/apache/airflow/constraints-2.10.3/constraints-3.11.txt
-
 numpy==1.26.4
 pandas==2.2.2
 pendulum==3.0.0
 boto3==1.34.0
-
 transformers==4.41.2
-faiss-cpu==1.8.0
-
-torch==2.3.0+cpu
