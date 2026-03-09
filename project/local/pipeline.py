@@ -10,6 +10,7 @@ Core functions:
 
 from __future__ import annotations
 
+import os
 import re
 import tarfile
 from collections import defaultdict
@@ -394,6 +395,13 @@ def compute_daily_stats(conn_params: dict, spark=None) -> None:
         If *None*, a local session is created (and stopped at the end).
     """
     from pyspark.sql import SparkSession
+
+    # On Windows, Spark expects these env vars to be set before JVM startup.
+    if os.name == "nt":
+        hadoop_home = Path.home() / ".hadoop"
+        (hadoop_home / "bin").mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("HADOOP_HOME", str(hadoop_home))
+        os.environ.setdefault("hadoop.home.dir", str(hadoop_home))
 
     own_spark = spark is None
     if own_spark:
