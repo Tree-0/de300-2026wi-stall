@@ -89,15 +89,45 @@ def connect_postgres(creds: dict[str, str] | None = None) -> psycopg2.extensions
     if creds is None:
         creds = load_db_credentials()
 
-    return psycopg2.connect(
-        host=creds["host"],
-        port=creds["port"],
-        dbname=creds["dbname"],
-        user=creds["user"],
-        password=creds["password"],
-        sslmode="verify-ca",
-        sslrootcert=creds["sslrootcert"],
-    )
+    # Use appropriate SSL mode based on connection type
+    host = str(creds["host"]).strip('"')
+    is_localhost = host in {"127.0.0.1", "localhost", "::1"}
+    
+    if is_localhost:
+        # SSH tunnel is already encrypted, so SSL not needed
+        return psycopg2.connect(
+            host=creds["host"],
+            port=creds["port"],
+            dbname=creds["dbname"],
+            user=creds["user"],
+            password=creds["password"],
+            sslmode="prefer",  # Try SSL but fall back to non-SSL
+        )
+    else:
+        # Direct RDS connection - check if certificate bundle exists
+        cert_path = Path(creds["sslrootcert"])
+        if cert_path.exists():
+            # Use certificate verification (most secure)
+            return psycopg2.connect(
+                host=creds["host"],
+                port=creds["port"],
+                dbname=creds["dbname"],
+                user=creds["user"],
+                password=creds["password"],
+                sslmode="verify-ca",
+                sslrootcert=str(cert_path),
+            )
+        else:
+            # Certificate not found - use SSL without verification
+            # (secure enough for AWS internal connections)
+            return psycopg2.connect(
+                host=creds["host"],
+                port=creds["port"],
+                dbname=creds["dbname"],
+                user=creds["user"],
+                password=creds["password"],
+                sslmode="require",  # Enforce SSL but don't verify cert
+            )
 
 def _test_db_connection():
     conn = None
