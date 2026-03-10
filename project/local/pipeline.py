@@ -185,7 +185,9 @@ def upsert_aggregates(
     Bulk-upsert parsed aggregates into Postgres.
 
     Uses ``psycopg2.extras.execute_values`` for performance.
-    Listen counts are *additive* on conflict so re-running is safe.
+    Daily listen rows are stored per dump for provenance:
+    ``(day, entity_id, dump_id)``.
+    Re-running the same dump is idempotent.
 
     Parameters
     ----------
@@ -205,6 +207,12 @@ def upsert_aggregates(
     dump_path = str(dump_path)
     m = re.search(r"dump-(\d+)-", dump_path)
     dump_id = m.group(1) if m else None
+    if not dump_id:
+        if dump_path:
+            # Fallback keeps provenance non-null even when naming deviates.
+            dump_id = dump_path
+        else:
+            raise ValueError("dump_path must contain a dump id (e.g., dump-2428-...) or be non-empty")
 
     conn.autocommit = False
     with conn, conn.cursor() as cur:
@@ -253,43 +261,41 @@ def upsert_aggregates(
             )
         print(f"done ({time.perf_counter() - t0:.1f}s)")
 
-        # --- track_daily_listens (additive) ---
+        # --- track_daily_listens (per dump, idempotent) ---
         t0 = time.perf_counter()
         n_track_daily = len(track_daily)
         print(f"  Upserting track_daily_listens ({n_track_daily:,} rows)...", end=" ", flush=True)
         for batch in _chunked(
-            [(day, rid, cnt) for (day, rid), cnt in track_daily.items()],
+            [(day, rid, dump_id, cnt) for (day, rid), cnt in track_daily.items()],
             50_000,
         ):
             execute_values(
                 cur,
                 """
-                INSERT INTO track_daily_listens (day, recording_id, listen_count)
+                INSERT INTO track_daily_listens (day, recording_id, dump_id, listen_count)
                 VALUES %s
-                ON CONFLICT (day, recording_id) DO UPDATE
-                  SET listen_count = track_daily_listens.listen_count
-                                   + EXCLUDED.listen_count
+                ON CONFLICT (day, recording_id, dump_id) DO UPDATE
+                  SET listen_count = EXCLUDED.listen_count
                 """,
                 batch,
             )
         print(f"done ({time.perf_counter() - t0:.1f}s)")
 
-        # --- artist_daily_listens (additive) ---
+        # --- artist_daily_listens (per dump, idempotent) ---
         t0 = time.perf_counter()
         n_artist_daily = len(artist_daily)
         print(f"  Upserting artist_daily_listens ({n_artist_daily:,} rows)...", end=" ", flush=True)
         for batch in _chunked(
-            [(day, mbid, cnt) for (day, mbid), cnt in artist_daily.items()],
+            [(day, mbid, dump_id, cnt) for (day, mbid), cnt in artist_daily.items()],
             50_000,
         ):
             execute_values(
                 cur,
                 """
-                INSERT INTO artist_daily_listens (day, artist_mbid, listen_count)
+                INSERT INTO artist_daily_listens (day, artist_mbid, dump_id, listen_count)
                 VALUES %s
-                ON CONFLICT (day, artist_mbid) DO UPDATE
-                  SET listen_count = artist_daily_listens.listen_count
-                                   + EXCLUDED.listen_count
+                ON CONFLICT (day, artist_mbid, dump_id) DO UPDATE
+                  SET listen_count = EXCLUDED.listen_count
                 """,
                 batch,
             )
@@ -322,8 +328,17 @@ def _compute_entity_stats(spark, jdbc_url: str, jdbc_props: dict,
     from pyspark.sql import functions as F
     from pyspark.sql.window import Window
 
-    df = spark.read.jdbc(url=jdbc_url, table=table_in, properties=jdbc_props)
-    print(f"Loaded {df.count():,} rows from {table_in}")
+    raw_df = spark.read.jdbc(url=jdbc_url, table=table_in, properties=jdbc_props)
+    raw_count = raw_df.count()
+    print(f"Loaded {raw_count:,} raw rows from {table_in}")
+
+    # Aggregate across dump_id so stats remain one row per (day, entity).
+    df = (
+        raw_df
+        .groupBy("day", id_col)
+        .agg(F.sum("listen_count").alias("listen_count"))
+    )
+    print(f"Using {df.count():,} aggregated day/entity rows from {table_in}")
 
     df = df.sort(id_col, "day")
 
