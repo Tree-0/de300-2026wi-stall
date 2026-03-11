@@ -1,0 +1,5 @@
+orjson==3.10.15
+psycopg2-binary==2.9.10
+python-dotenv==1.0.1
+tqdm==4.67.1
+zstandard==0.23.0

@@ -1,8 +1,8 @@
-"""Recompute and populate ListenBrainz v2 daily stats tables.
+"""Recompute and populate ListenBrainz daily stats tables.
 
 This script fills:
-- artist_daily_stats_v2  (reads from artist_daily_listens_v2, key: artist_id)
-- track_daily_stats_v2   (reads from track_daily_listens_v2,  key: recording_id)
+- artist_daily_stats  (reads from artist_daily_listens, key: artist_id)
+- track_daily_stats   (reads from track_daily_listens,  key: recording_id)
 
 It reuses pipeline._compute_entity_stats(), so the rolling-window math is
 identical to the v1 stats job.
@@ -22,7 +22,7 @@ from utils import load_db_credentials
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Recompute v2 artist/track daily stats in Postgres"
+        description="Recompute artist/track daily stats in Postgres"
     )
     parser.add_argument(
         "--env-file",
@@ -114,23 +114,23 @@ def main() -> None:
         if args.entity in ("artist", "both"):
             _compute_entity_stats(
                 spark, jdbc_url, jdbc_props,
-                "artist_daily_listens_v2",  # source
-                "artist_daily_stats_v2",    # destination
-                "artist_id",                # key col (v2 uses artist_id, not artist_mbid)
+                "artist_daily_listens",  # source
+                "artist_daily_stats",    # destination
+                "artist_id",
             )
 
         if args.entity in ("track", "both"):
             _compute_entity_stats(
                 spark, jdbc_url, jdbc_props,
-                "track_daily_listens_v2",   # source
-                "track_daily_stats_v2",     # destination
+                "track_daily_listens",   # source
+                "track_daily_stats",     # destination
                 "recording_id",
             )
     finally:
         spark.stop()
         print("Spark session stopped.")
 
-    print("v2 daily stats refresh complete.")
+    print("Daily stats refresh complete.")
 
 
 if __name__ == "__main__":

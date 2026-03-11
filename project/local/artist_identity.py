@@ -11,12 +11,40 @@ _MUSICBRAINZ_UUID_RE = re.compile(
     flags=re.IGNORECASE,
 )
 
-# Split tokens like: "A feat. B, C & D" -> ["A", "B", "C", "D"]
+# Split tokens like:
+#   "A feat. B, C & D" -> ["A", "B", "C", "D"]
+#   "AwithB" is not split, but "A with B" and "Awith\u65e5\u672c\u8a9e" can be
+#   split when marker words are clearly delimited from ASCII words.
+# Slash handling is intentionally stricter and happens after the main regex so
+# credits like "boywithuke/blackbear" split, but "AC/DC", URLs, "//", and
+# tokens with nearby punctuation such as "+" or "-" do not.
 _ARTIST_SPLIT_RE = re.compile(
-    r"\s+(?:feat\.?|featuring|ft\.?)\s+|\s*&\s*|\s*,\s*|\s*;\s*|\s*•\s*",
-    flags=re.IGNORECASE,
+        r"""
+        \s*(?:,|;|&|\uFF06|\u3001|\u30FB|\u2022)\s*                # punctuation separators
+        |\s+(?:x|\u00D7)\s+                                          # x / \u00D7 between names
+        |\s*(?:\(|\[|\{)?\s*
+            (?<![A-Za-z0-9])(?:
+                featured\s+by(?![A-Za-z0-9])
+                |featuring(?![A-Za-z0-9])
+                |(?:feat|ft)\.(?=\S)                                  # allow feat./ft. with no space after dot
+                |(?:feat|ft)\.?(?![A-Za-z0-9])
+            )
+            \s*(?:\)|\]|\})?\s*                                      # feat/ft/featuring/featured by
+        |\s*(?:\(|\[|\{)?\s*
+            (?<![A-Za-z0-9])(?:with|vs\.?|versus)(?![A-Za-z0-9])
+            \s*(?:\)|\]|\})?\s*                                      # with/vs/versus
+        """,
+        flags=re.IGNORECASE | re.VERBOSE,
 )
 _SPACE_RE = re.compile(r"\s+")
+_SLASH_PAIR_RE = re.compile(
+    r"^\s*(?P<left>[^/\uFF0F]+?)\s*(?<!/)(?:/|\uFF0F)(?!/)\s*(?P<right>[^/\uFF0F]+?)\s*$"
+)
+_ASCII_UPPER_RE = re.compile(r"^[A-Z0-9]+$")
+_TOKEN_EDGE_RE = re.compile(
+        r"^[\s\(\[\{<\"'`\u300C\u300D\u300E\u300F\u3010\u3011\uFF08\uFF09\uFF3B\uFF3D\uFF5B\uFF5D]+"
+        r"|[\s\)\]\}>\"'`\u300C\u300D\u300E\u300F\u3010\u3011\uFF08\uFF09\uFF3B\uFF3D\uFF5B\uFF5D]+$"
+)
 
 
 ArtistEntity = tuple[str, str | None, bool]
@@ -29,16 +57,60 @@ def normalize_artist_token(value: str | None) -> str:
     return cleaned
 
 
+def _is_clean_slash_side(value: str) -> bool:
+    token = _SPACE_RE.sub(" ", value).strip()
+    if not token:
+        return False
+    if not any(char.isalnum() for char in token):
+        return False
+    return all(char.isalnum() or char.isspace() for char in token)
+
+
+def _looks_like_ascii_acronym(value: str) -> bool:
+    token = _SPACE_RE.sub(" ", value).strip().replace(" ", "")
+    return bool(token) and bool(_ASCII_UPPER_RE.fullmatch(token))
+
+
+def split_slash_artist_credit(artist_credit: str | None) -> list[str]:
+    if not artist_credit:
+        return []
+
+    match = _SLASH_PAIR_RE.match(artist_credit)
+    if not match:
+        return []
+
+    left = _SPACE_RE.sub(" ", match.group("left")).strip()
+    right = _SPACE_RE.sub(" ", match.group("right")).strip()
+
+    if not _is_clean_slash_side(left) or not _is_clean_slash_side(right):
+        return []
+
+    if _looks_like_ascii_acronym(left) and _looks_like_ascii_acronym(right):
+        return []
+
+    return [left, right]
+
+
 def split_artist_credit(artist_credit: str | None) -> list[str]:
     if not artist_credit:
         return []
     parts = _ARTIST_SPLIT_RE.split(artist_credit)
     tokens: list[str] = []
     for part in parts:
-        token = _SPACE_RE.sub(" ", part).strip()
-        if token:
-            tokens.append(token)
+        slash_parts = split_slash_artist_credit(part)
+        candidate_parts = slash_parts if slash_parts else [part]
+        for candidate in candidate_parts:
+            token = _SPACE_RE.sub(" ", candidate).strip()
+            token = _TOKEN_EDGE_RE.sub("", token).strip()
+            if token:
+                tokens.append(token)
     return tokens
+
+
+def has_artist_collab_markers(artist_credit: str | None) -> bool:
+    if not artist_credit:
+        return False
+    return bool(_ARTIST_SPLIT_RE.search(artist_credit) or split_slash_artist_credit(artist_credit))
 
 
 def synth_artist_mbid_from_token(token: str) -> str:

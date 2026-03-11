@@ -8,7 +8,7 @@ Design goals:
 4. Persist synthetic-key flags for data quality analysis.
 5. Persist release date when available in dump metadata.
 
-This module writes to *_v2 tables so you can validate behavior safely.
+This module writes to canonical tables.
 """
 
 from __future__ import annotations
@@ -25,7 +25,12 @@ from typing import TYPE_CHECKING
 import orjson
 from psycopg2 import errors
 
-from artist_identity import build_alias_map, normalize_artist_token
+from artist_identity import (
+    build_alias_map,
+    has_artist_collab_markers,
+    normalize_artist_token,
+    split_artist_credit,
+)
 from pipeline import day_from_unix, iter_listens_from_tar_zst
 from utils import connect_postgres, load_db_credentials
 
@@ -61,20 +66,20 @@ def normalize_text(value) -> str | None:
 
 
 def _load_alias_map_from_db(conn: psycopg2.extensions.connection) -> dict[str, str]:
-    """Load known artist-name aliases from artist_info_v2 for canonical ID reuse."""
+    """Load known artist-name aliases from artist_info for canonical ID reuse."""
     try:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 SELECT artist_id, artist_name
-                FROM artist_info_v2
+                FROM artist_info
                 WHERE artist_name IS NOT NULL
                 """
             )
             rows = cur.fetchall()
         return build_alias_map(rows)
     except errors.UndefinedTable:
-        # parse_dump_v2 can run before ensure_v2_tables(); treat as empty alias map.
+        # parse_dump can run before ensure_tables(); treat as empty alias map.
         conn.rollback()
         return {}
 
@@ -186,34 +191,17 @@ def split_artist_name_collabs(artist_name) -> list[str]:
     """
     Split artist collab strings into individual artist names.
 
-    Handles common patterns such as:
-      - "x feat. y"
-      - "x featuring y"
-      - "x ft. y"
-            - "x with y"
-      - "x x y" (common collab marker in some catalogs)
+    Delegates to split_artist_credit() (the single source of truth in
+    artist_identity._ARTIST_SPLIT_RE) and then normalizes each part with
+    normalize_text().
 
-        Intentionally avoids auto-splitting plain commas and "and" because
-        many valid single-artist names contain them (e.g. "Tyler, The Creator").
+    Handles: feat./featuring/ft./featured by, vs./versus, with, x,
+             &, commas, semicolons, bullets.
     """
     if not artist_name:
         return []
-
-    text = str(artist_name)
-    split_patterns = [
-        r"\s*;\s*",
-        r"\s*•\s*",
-        r"\s+feat\.?\s+",
-        r"\s+featuring\s+",
-        r"\s+ft\.?\s+",
-        r"\s+with\s+",
-        r"\s+x\s+",
-    ]
-
-    for pattern in split_patterns:
-        text = re.sub(pattern, "|", text, flags=re.IGNORECASE)
-
-    parts = [normalize_text(part) for part in text.split("|")]
+    raw_parts = split_artist_credit(str(artist_name))
+    parts = [normalize_text(part) for part in raw_parts]
     parts = [part for part in parts if part]
     return _dedupe_preserve_order(parts)
 
@@ -243,15 +231,7 @@ def extract_artist_name_candidates(track_metadata: dict, additional_info: dict) 
 
 
 def has_collab_markers(artist_name) -> bool:
-    if not artist_name:
-        return False
-    text = str(artist_name).lower()
-    return bool(
-        re.search(
-            r"\b(feat\.?|featuring|ft\.?|with)\b|\s+x\s+|;|•|&|,",
-            text,
-        )
-    )
+    return has_artist_collab_markers(artist_name)
 
 
 def choose_artist_identities(
@@ -299,9 +279,9 @@ def choose_artist_identities(
     return identities, used_multi_name_candidates
 
 
-def ensure_v2_tables(conn: psycopg2.extensions.connection) -> None:
+def ensure_tables(conn: psycopg2.extensions.connection) -> None:
     ddl = """
-        CREATE TABLE IF NOT EXISTS artist_info_v2 (
+        CREATE TABLE IF NOT EXISTS artist_info (
             artist_id TEXT PRIMARY KEY,
             artist_mbid TEXT,
             fallback_key TEXT,
@@ -311,12 +291,12 @@ def ensure_v2_tables(conn: psycopg2.extensions.connection) -> None:
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
 
-        CREATE INDEX IF NOT EXISTS idx_artist_info_v2_artist_mbid
-            ON artist_info_v2(artist_mbid);
-        CREATE INDEX IF NOT EXISTS idx_artist_info_v2_is_synth
-            ON artist_info_v2(is_synthetic_fallback_key);
+        CREATE INDEX IF NOT EXISTS idx_artist_info_artist_mbid
+            ON artist_info(artist_mbid);
+        CREATE INDEX IF NOT EXISTS idx_artist_info_is_synth
+            ON artist_info(is_synthetic_fallback_key);
 
-    CREATE TABLE IF NOT EXISTS track_info_v2 (
+    CREATE TABLE IF NOT EXISTS track_info (
       recording_id TEXT PRIMARY KEY,
       recording_mbid TEXT,
       fallback_key TEXT,
@@ -330,40 +310,40 @@ def ensure_v2_tables(conn: psycopg2.extensions.connection) -> None:
       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
 
-    CREATE INDEX IF NOT EXISTS idx_track_info_v2_recording_mbid
-      ON track_info_v2(recording_mbid);
-    CREATE INDEX IF NOT EXISTS idx_track_info_v2_is_synth
-      ON track_info_v2(is_synthetic_fallback_key);
+        CREATE INDEX IF NOT EXISTS idx_track_info_recording_mbid
+            ON track_info(recording_mbid);
+        CREATE INDEX IF NOT EXISTS idx_track_info_is_synth
+            ON track_info(is_synthetic_fallback_key);
 
-        CREATE TABLE IF NOT EXISTS artist_daily_listens_v2 (
+                CREATE TABLE IF NOT EXISTS artist_daily_listens (
             day DATE NOT NULL,
             artist_id TEXT NOT NULL,
             dump_id TEXT NOT NULL,
             listen_count BIGINT NOT NULL,
             PRIMARY KEY (day, artist_id, dump_id),
-            FOREIGN KEY (artist_id) REFERENCES artist_info_v2(artist_id)
+                        FOREIGN KEY (artist_id) REFERENCES artist_info(artist_id)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_artist_daily_v2_day
-            ON artist_daily_listens_v2(day);
-        CREATE INDEX IF NOT EXISTS idx_artist_daily_v2_dump
-            ON artist_daily_listens_v2(dump_id);
+                CREATE INDEX IF NOT EXISTS idx_artist_daily_day
+                        ON artist_daily_listens(day);
+                CREATE INDEX IF NOT EXISTS idx_artist_daily_dump
+                        ON artist_daily_listens(dump_id);
 
-    CREATE TABLE IF NOT EXISTS track_daily_listens_v2 (
+        CREATE TABLE IF NOT EXISTS track_daily_listens (
       day DATE NOT NULL,
       recording_id TEXT NOT NULL,
       dump_id TEXT NOT NULL,
       listen_count BIGINT NOT NULL,
       PRIMARY KEY (day, recording_id, dump_id),
-      FOREIGN KEY (recording_id) REFERENCES track_info_v2(recording_id)
+            FOREIGN KEY (recording_id) REFERENCES track_info(recording_id)
     );
 
-    CREATE INDEX IF NOT EXISTS idx_track_daily_v2_day
-      ON track_daily_listens_v2(day);
-    CREATE INDEX IF NOT EXISTS idx_track_daily_v2_dump
-      ON track_daily_listens_v2(dump_id);
+        CREATE INDEX IF NOT EXISTS idx_track_daily_day
+            ON track_daily_listens(day);
+        CREATE INDEX IF NOT EXISTS idx_track_daily_dump
+            ON track_daily_listens(dump_id);
 
-        CREATE TABLE IF NOT EXISTS artist_daily_stats_v2 (
+                CREATE TABLE IF NOT EXISTS artist_daily_stats (
             day DATE NOT NULL,
             artist_id TEXT NOT NULL,
             growth_percentile FLOAT,
@@ -373,10 +353,10 @@ def ensure_v2_tables(conn: psycopg2.extensions.connection) -> None:
             listen_count_past_30_days BIGINT,
             listen_pctl_past_30_days FLOAT,
             PRIMARY KEY (day, artist_id),
-            FOREIGN KEY (artist_id) REFERENCES artist_info_v2(artist_id)
+                        FOREIGN KEY (artist_id) REFERENCES artist_info(artist_id)
         );
 
-    CREATE TABLE IF NOT EXISTS track_daily_stats_v2 (
+        CREATE TABLE IF NOT EXISTS track_daily_stats (
       day DATE NOT NULL,
       recording_id TEXT NOT NULL,
       growth_percentile FLOAT,
@@ -386,7 +366,7 @@ def ensure_v2_tables(conn: psycopg2.extensions.connection) -> None:
       listen_count_past_30_days BIGINT,
       listen_pctl_past_30_days FLOAT,
       PRIMARY KEY (day, recording_id),
-      FOREIGN KEY (recording_id) REFERENCES track_info_v2(recording_id)
+            FOREIGN KEY (recording_id) REFERENCES track_info(recording_id)
     );
     """
 
@@ -395,7 +375,7 @@ def ensure_v2_tables(conn: psycopg2.extensions.connection) -> None:
         cur.execute(ddl)
 
 
-def parse_dump_v2(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[str, str] | None = None):
+def parse_dump(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[str, str] | None = None):
     """
     Parse one dump with canonical-first track identity logic.
 
@@ -427,6 +407,7 @@ def parse_dump_v2(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[st
     rows_with_artist_names_array = 0
     rows_with_release_artist_names_array = 0
     rows_with_collab_markers_in_artist_name = 0
+    dropped_rows_missing_artist_signals = 0
 
     used_recording_mbid = 0
     used_fallback_key = 0
@@ -489,6 +470,13 @@ def parse_dump_v2(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[st
 
         if release_date:
             release_date_present_rows += 1
+
+        artist_name_candidates = extract_artist_name_candidates(tm, add)
+        if not artist_mbids and not artist_name_candidates:
+            # Skip rows with no artist MBID and no usable artist-name signal.
+            # Requested behavior: do not save these rows to track or artist tables.
+            dropped_rows_missing_artist_signals += 1
+            continue
 
         artist_identities, used_multi_name_candidates = choose_artist_identities(
             artist_mbids,
@@ -563,6 +551,7 @@ def parse_dump_v2(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[st
         "rows_with_artist_names_array": rows_with_artist_names_array,
         "rows_with_release_artist_names_array": rows_with_release_artist_names_array,
         "rows_with_collab_markers_in_artist_name": rows_with_collab_markers_in_artist_name,
+        "dropped_rows_missing_artist_signals": dropped_rows_missing_artist_signals,
 
         "used_recording_mbid": used_recording_mbid,
         "used_fallback_key": used_fallback_key,
@@ -579,10 +568,10 @@ def parse_dump_v2(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[st
         # Backward-compatible alias used by earlier prints.
         "release_date_present_rows": release_date_present_rows,
 
-        "unique_track_day_keys_v2": len(track_daily),
-        "unique_artist_day_keys_v2": len(artist_daily),
-        "unique_tracks_v2": len({key[1] for key in track_daily.keys()}),
-        "unique_artists_v2": len({key[1] for key in artist_daily.keys()}),
+        "unique_track_day_keys": len(track_daily),
+        "unique_artist_day_keys": len(artist_daily),
+        "unique_tracks": len({key[1] for key in track_daily.keys()}),
+        "unique_artists": len({key[1] for key in artist_daily.keys()}),
     }
 
     return track_daily, artist_daily, track_info, artist_info, summary
@@ -610,6 +599,7 @@ def print_parser_details(summary: dict) -> None:
     print(f"  usable_rows:             {summary['usable_rows']:,}")
     print(f"  bad_json:                {summary['bad_json']:,}")
     print(f"  missing_timestamp:       {summary['missing_timestamp']:,}")
+    print(f"  dropped_no_artist_signals:{summary['dropped_rows_missing_artist_signals']:,} ({_pct(summary['dropped_rows_missing_artist_signals'], usable):6.2f}%)")
     print()
 
     print("TRACK IDENTITY")
@@ -617,8 +607,8 @@ def print_parser_details(summary: dict) -> None:
     print(f"  used_fallback_key:       {summary['used_fallback_key']:,} ({_pct(summary['used_fallback_key'], usable):6.2f}%)")
     print(f"  dropped_missing_identity:{summary['dropped_missing_identity']:,} ({_pct(summary['dropped_missing_identity'], usable):6.2f}%)")
     print(f"  track_release_date_present_rows:{track_release_rows:,} ({_pct(track_release_rows, usable):6.2f}%)")
-    print(f"  unique_tracks_v2:        {summary['unique_tracks_v2']:,}")
-    print(f"  unique_track_day_keys_v2 (distinct day+recording_id): {summary['unique_track_day_keys_v2']:,}")
+    print(f"  unique_tracks:        {summary['unique_tracks']:,}")
+    print(f"  unique_track_day_keys (distinct day+recording_id): {summary['unique_track_day_keys']:,}")
     print()
 
     print("ARTIST IDENTITY")
@@ -627,8 +617,8 @@ def print_parser_details(summary: dict) -> None:
     print(f"  dropped_artist_identity_rows:{summary['dropped_artist_identity_rows']:,} ({_pct(summary['dropped_artist_identity_rows'], usable):6.2f}%)")
     print(f"  generated_artist_daily_rows:{summary['generated_artist_daily_rows']:,}")
     print(f"  rows_with_multi_artist_candidates:{summary['rows_with_multi_artist_candidates']:,} ({_pct(summary['rows_with_multi_artist_candidates'], usable):6.2f}%)")
-    print(f"  unique_artists_v2:       {summary['unique_artists_v2']:,}")
-    print(f"  unique_artist_day_keys_v2 (distinct day+artist_id): {summary['unique_artist_day_keys_v2']:,}")
+    print(f"  unique_artists:       {summary['unique_artists']:,}")
+    print(f"  unique_artist_day_keys (distinct day+artist_id): {summary['unique_artist_day_keys']:,}")
     print()
 
     print("FIELD QUALITY")
@@ -641,7 +631,7 @@ def print_parser_details(summary: dict) -> None:
     print("=" * 72)
 
 
-def upsert_v2(
+def upsert(
     conn: psycopg2.extensions.connection,
     track_daily: dict,
     artist_daily: dict,
@@ -660,7 +650,7 @@ def upsert_v2(
     conn.autocommit = False
     with conn, conn.cursor() as cur:
         t0 = time.perf_counter()
-        print(f"Upserting artist_info_v2 ({len(artist_info):,} rows)...", end=" ", flush=True)
+        print(f"Upserting artist_info ({len(artist_info):,} rows)...", end=" ", flush=True)
         rows = [
             (
                 artist_id,
@@ -675,7 +665,7 @@ def upsert_v2(
             execute_values(
                 cur,
                 """
-                INSERT INTO artist_info_v2 (
+                                INSERT INTO artist_info (
                   artist_id,
                   artist_mbid,
                   fallback_key,
@@ -684,10 +674,10 @@ def upsert_v2(
                 )
                 VALUES %s
                 ON CONFLICT (artist_id) DO UPDATE
-                  SET artist_mbid = COALESCE(EXCLUDED.artist_mbid, artist_info_v2.artist_mbid),
-                      fallback_key = COALESCE(EXCLUDED.fallback_key, artist_info_v2.fallback_key),
+                                    SET artist_mbid = COALESCE(EXCLUDED.artist_mbid, artist_info.artist_mbid),
+                                            fallback_key = COALESCE(EXCLUDED.fallback_key, artist_info.fallback_key),
                       is_synthetic_fallback_key = EXCLUDED.is_synthetic_fallback_key,
-                      artist_name = COALESCE(EXCLUDED.artist_name, artist_info_v2.artist_name),
+                                            artist_name = COALESCE(EXCLUDED.artist_name, artist_info.artist_name),
                       updated_at = now()
                 """,
                 batch,
@@ -695,7 +685,7 @@ def upsert_v2(
         print(f"done ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
-        print(f"Upserting track_info_v2 ({len(track_info):,} rows)...", end=" ", flush=True)
+        print(f"Upserting track_info ({len(track_info):,} rows)...", end=" ", flush=True)
         rows = [
             (
                 rid,
@@ -714,7 +704,7 @@ def upsert_v2(
             execute_values(
                 cur,
                 """
-                INSERT INTO track_info_v2 (
+                                INSERT INTO track_info (
                   recording_id,
                   recording_mbid,
                   fallback_key,
@@ -727,14 +717,14 @@ def upsert_v2(
                 )
                 VALUES %s
                 ON CONFLICT (recording_id) DO UPDATE
-                  SET recording_mbid = COALESCE(EXCLUDED.recording_mbid, track_info_v2.recording_mbid),
-                      fallback_key = COALESCE(EXCLUDED.fallback_key, track_info_v2.fallback_key),
+                  SET recording_mbid = COALESCE(EXCLUDED.recording_mbid, track_info.recording_mbid),
+                      fallback_key = COALESCE(EXCLUDED.fallback_key, track_info.fallback_key),
                       is_synthetic_fallback_key = EXCLUDED.is_synthetic_fallback_key,
-                      track_name = COALESCE(EXCLUDED.track_name, track_info_v2.track_name),
-                      artist_name = COALESCE(EXCLUDED.artist_name, track_info_v2.artist_name),
-                      artist_mbids = COALESCE(EXCLUDED.artist_mbids, track_info_v2.artist_mbids),
-                      release_name = COALESCE(EXCLUDED.release_name, track_info_v2.release_name),
-                      release_date = COALESCE(EXCLUDED.release_date, track_info_v2.release_date),
+                      track_name = COALESCE(EXCLUDED.track_name, track_info.track_name),
+                      artist_name = COALESCE(EXCLUDED.artist_name, track_info.artist_name),
+                      artist_mbids = COALESCE(EXCLUDED.artist_mbids, track_info.artist_mbids),
+                      release_name = COALESCE(EXCLUDED.release_name, track_info.release_name),
+                      release_date = COALESCE(EXCLUDED.release_date, track_info.release_date),
                       updated_at = now()
                 """,
                 batch,
@@ -742,13 +732,13 @@ def upsert_v2(
         print(f"done ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
-        print(f"Upserting artist_daily_listens_v2 ({len(artist_daily):,} rows)...", end=" ", flush=True)
+        print(f"Upserting artist_daily_listens ({len(artist_daily):,} rows)...", end=" ", flush=True)
         rows = [(day, artist_id, dump_id, cnt) for (day, artist_id), cnt in artist_daily.items()]
         for batch in _chunked(rows, 50_000):
             execute_values(
                 cur,
                 """
-                INSERT INTO artist_daily_listens_v2 (day, artist_id, dump_id, listen_count)
+                                INSERT INTO artist_daily_listens (day, artist_id, dump_id, listen_count)
                 VALUES %s
                 ON CONFLICT (day, artist_id, dump_id) DO UPDATE
                   SET listen_count = EXCLUDED.listen_count
@@ -758,13 +748,13 @@ def upsert_v2(
         print(f"done ({time.perf_counter() - t0:.1f}s)")
 
         t0 = time.perf_counter()
-        print(f"Upserting track_daily_listens_v2 ({len(track_daily):,} rows)...", end=" ", flush=True)
+        print(f"Upserting track_daily_listens ({len(track_daily):,} rows)...", end=" ", flush=True)
         rows = [(day, rid, dump_id, cnt) for (day, rid), cnt in track_daily.items()]
         for batch in _chunked(rows, 50_000):
             execute_values(
                 cur,
                 """
-                INSERT INTO track_daily_listens_v2 (day, recording_id, dump_id, listen_count)
+                                INSERT INTO track_daily_listens (day, recording_id, dump_id, listen_count)
                 VALUES %s
                 ON CONFLICT (day, recording_id, dump_id) DO UPDATE
                   SET listen_count = EXCLUDED.listen_count
@@ -783,7 +773,7 @@ def parse_args():
     parser.add_argument(
         "--upsert",
         action="store_true",
-        help="Create v2 tables and write parsed output to Postgres",
+        help="Create tables and write parsed output to Postgres",
     )
     return parser.parse_args()
 
@@ -796,7 +786,7 @@ def main():
     finally:
         alias_conn.close()
 
-    track_daily, artist_daily, track_info, artist_info, summary = parse_dump_v2(
+    track_daily, artist_daily, track_info, artist_info, summary = parse_dump(
         args.dump_path,
         max_lines=args.max_lines,
         alias_to_mbid=alias_to_mbid,
@@ -810,8 +800,8 @@ def main():
     # connect_postgres() loads credentials from .env / Secrets Manager.
     conn = connect_postgres()
     try:
-        ensure_v2_tables(conn)
-        upsert_v2(conn, track_daily, artist_daily, track_info, artist_info, args.dump_path)
+        ensure_tables(conn)
+        upsert(conn, track_daily, artist_daily, track_info, artist_info, args.dump_path)
     finally:
         conn.close()
 
