@@ -6,6 +6,7 @@ from psycopg2.extras import execute_values
 
 from artist_identity import (
     build_alias_map,
+    normalize_artist_token,
     split_artist_credit,
     synth_artist_mbid_from_token,
 )
@@ -53,7 +54,32 @@ def _build_remap_rows(artist_rows: list[tuple[str, str | None]]) -> list[tuple[s
         seen.add(key)
         deduped.append((old_mbid, new_mbid, new_name, is_synth))
 
-    return deduped
+    # Collapse distinct MBIDs that normalize to the same artist-name key.
+    # This ensures one canonical MBID per normalized name, so downstream tables
+    # reference a single artist identity for equivalent names.
+    canonical_by_name: dict[str, str] = {}
+    mbid_to_canonical: dict[str, str] = {}
+    for _, new_mbid, new_name, _ in deduped:
+        name_key = normalize_artist_token(new_name)
+        if not name_key:
+            continue
+        canonical = canonical_by_name.get(name_key)
+        if canonical is None:
+            canonical_by_name[name_key] = new_mbid
+            continue
+        mbid_to_canonical[new_mbid] = canonical
+
+    collapsed: list[tuple[str, str, str | None, bool]] = []
+    seen_collapsed: set[tuple[str, str]] = set()
+    for old_mbid, new_mbid, new_name, is_synth in deduped:
+        canonical_mbid = mbid_to_canonical.get(new_mbid, new_mbid)
+        key = (old_mbid, canonical_mbid)
+        if key in seen_collapsed:
+            continue
+        seen_collapsed.add(key)
+        collapsed.append((old_mbid, canonical_mbid, new_name, is_synth and canonical_mbid == new_mbid))
+
+    return collapsed
 
 
 def _has_column(cur, table_name: str, column_name: str) -> bool:
@@ -137,7 +163,7 @@ def run_migration(apply_changes: bool) -> None:
                 FROM _artist_mbid_remap
                 GROUP BY new_artist_mbid
                 ON CONFLICT (artist_mbid) DO UPDATE
-                  SET artist_name = COALESCE(artist_info.artist_name, EXCLUDED.artist_name)
+                    SET artist_name = COALESCE(EXCLUDED.artist_name, artist_info.artist_name)
                 """
             )
 
@@ -154,15 +180,19 @@ def run_migration(apply_changes: bool) -> None:
                     JOIN _artist_mbid_remap m
                       ON m.old_artist_mbid = u.old_artist_mbid
                 ),
-                dedup AS (
-                    SELECT DISTINCT recording_id, ord, new_artist_mbid
+                per_mbid AS (
+                    SELECT
+                        recording_id,
+                        new_artist_mbid,
+                        MIN(ord) AS first_ord
                     FROM expanded
+                    GROUP BY recording_id, new_artist_mbid
                 ),
                 rebuilt AS (
                     SELECT
                         recording_id,
-                        array_agg(new_artist_mbid ORDER BY ord, new_artist_mbid) AS new_artist_mbids
-                    FROM dedup
+                        array_agg(new_artist_mbid ORDER BY first_ord, new_artist_mbid) AS new_artist_mbids
+                    FROM per_mbid
                     GROUP BY recording_id
                 )
                 UPDATE track_info t
@@ -218,6 +248,55 @@ def run_migration(apply_changes: bool) -> None:
                     FROM _artist_daily_listens_clean
                     """
                 )
+
+            # Remove duplicate artist_info rows for the same normalized name when
+            # they are no longer referenced by track_info or artist_daily_listens.
+            # Keep one canonical row per name, preferring rows that still have refs.
+            cur.execute(
+                """
+                WITH normalized AS (
+                    SELECT
+                        ai.artist_mbid,
+                        lower(regexp_replace(trim(ai.artist_name), '\\s+', ' ', 'g')) AS name_key
+                    FROM artist_info ai
+                    WHERE NULLIF(trim(ai.artist_name), '') IS NOT NULL
+                ),
+                with_refs AS (
+                    SELECT
+                        n.artist_mbid,
+                        n.name_key,
+                        (
+                            EXISTS (
+                                SELECT 1
+                                FROM track_info t
+                                CROSS JOIN LATERAL unnest(COALESCE(t.artist_mbids, ARRAY[]::TEXT[])) AS u(mbid)
+                                WHERE u.mbid = n.artist_mbid
+                            )
+                            OR EXISTS (
+                                SELECT 1
+                                FROM artist_daily_listens adl
+                                WHERE adl.artist_mbid = n.artist_mbid
+                            )
+                        ) AS has_refs
+                    FROM normalized n
+                ),
+                ranked AS (
+                    SELECT
+                        wr.artist_mbid,
+                        row_number() OVER (
+                            PARTITION BY wr.name_key
+                            ORDER BY wr.has_refs DESC, wr.artist_mbid
+                        ) AS rn,
+                        wr.has_refs
+                    FROM with_refs wr
+                )
+                DELETE FROM artist_info ai
+                USING ranked r
+                WHERE ai.artist_mbid = r.artist_mbid
+                  AND r.rn > 1
+                  AND r.has_refs = FALSE
+                """
+            )
 
             # Stats become invalid after MBID remap; force recomputation from listens.
             cur.execute("TRUNCATE artist_daily_stats")

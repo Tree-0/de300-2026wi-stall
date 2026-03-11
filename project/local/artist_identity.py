@@ -13,7 +13,7 @@ _MUSICBRAINZ_UUID_RE = re.compile(
 
 # Split tokens like: "A feat. B, C & D" -> ["A", "B", "C", "D"]
 _ARTIST_SPLIT_RE = re.compile(
-    r"\s+(?:feat\.?|featuring)\s+|\s*&\s*|\s*,\s*|\s*;\s*|\s*•\s*",
+    r"\s+(?:feat\.?|featuring|ft\.?)\s+|\s*&\s*|\s*,\s*|\s*;\s*|\s*•\s*",
     flags=re.IGNORECASE,
 )
 _SPACE_RE = re.compile(r"\s+")

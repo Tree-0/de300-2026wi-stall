@@ -23,7 +23,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import orjson
+from psycopg2 import errors
 
+from artist_identity import build_alias_map, normalize_artist_token
 from pipeline import day_from_unix, iter_listens_from_tar_zst
 from utils import connect_postgres, load_db_credentials
 
@@ -56,6 +58,25 @@ def normalize_text(value) -> str | None:
     text = re.sub(r"\s+", " ", text)
     text = text.replace("||", " ")
     return text or None
+
+
+def _load_alias_map_from_db(conn: psycopg2.extensions.connection) -> dict[str, str]:
+    """Load known artist-name aliases from artist_info_v2 for canonical ID reuse."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT artist_id, artist_name
+                FROM artist_info_v2
+                WHERE artist_name IS NOT NULL
+                """
+            )
+            rows = cur.fetchall()
+        return build_alias_map(rows)
+    except errors.UndefinedTable:
+        # parse_dump_v2 can run before ensure_v2_tables(); treat as empty alias map.
+        conn.rollback()
+        return {}
 
 
 def normalize_artist_mbids(raw_artist_mbids) -> list[str]:
@@ -233,7 +254,12 @@ def has_collab_markers(artist_name) -> bool:
     )
 
 
-def choose_artist_identities(artist_mbids: list[str], track_metadata: dict, additional_info: dict):
+def choose_artist_identities(
+    artist_mbids: list[str],
+    track_metadata: dict,
+    additional_info: dict,
+    alias_to_mbid: dict[str, str] | None = None,
+):
     """
     Return tuple:
       (identities, used_multi_name_candidates)
@@ -261,6 +287,12 @@ def choose_artist_identities(artist_mbids: list[str], track_metadata: dict, addi
         return identities, used_multi_name_candidates
 
     for name_value in candidate_names:
+        if alias_to_mbid:
+            known_artist_id = alias_to_mbid.get(normalize_artist_token(name_value))
+            if known_artist_id:
+                identities.append((known_artist_id, known_artist_id, None, False, name_value))
+                continue
+
         fallback_key = name_value
         identities.append((f"fallback_artist::{fallback_key}", None, fallback_key, True, name_value))
 
@@ -363,7 +395,7 @@ def ensure_v2_tables(conn: psycopg2.extensions.connection) -> None:
         cur.execute(ddl)
 
 
-def parse_dump_v2(source: Path | str, max_lines: int = 0):
+def parse_dump_v2(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[str, str] | None = None):
     """
     Parse one dump with canonical-first track identity logic.
 
@@ -375,6 +407,9 @@ def parse_dump_v2(source: Path | str, max_lines: int = 0):
       summary: dict
     """
     source = Path(source)
+
+    if alias_to_mbid is None:
+        alias_to_mbid = {}
 
     track_daily: dict = defaultdict(int)
     artist_daily: dict = defaultdict(int)
@@ -455,6 +490,16 @@ def parse_dump_v2(source: Path | str, max_lines: int = 0):
         if release_date:
             release_date_present_rows += 1
 
+        artist_identities, used_multi_name_candidates = choose_artist_identities(
+            artist_mbids,
+            tm,
+            add,
+            alias_to_mbid=alias_to_mbid,
+        )
+        artist_ids_for_track = _dedupe_preserve_order([item[0] for item in artist_identities])
+        if used_multi_name_candidates:
+            rows_with_multi_artist_candidates += 1
+
         recording_id, fallback_key, is_synthetic = choose_recording_identity(
             recording_mbid=recording_mbid,
             artist_name=artist_name,
@@ -479,18 +524,10 @@ def parse_dump_v2(source: Path | str, max_lines: int = 0):
                     is_synthetic,
                     track_name,
                     artist_name,
-                    artist_mbids,
+                    artist_ids_for_track,
                     release_name,
                     release_date,
                 )
-
-        artist_identities, used_multi_name_candidates = choose_artist_identities(
-            artist_mbids,
-            tm,
-            add,
-        )
-        if used_multi_name_candidates:
-            rows_with_multi_artist_candidates += 1
 
         if not artist_identities:
             dropped_artist_identity_rows += 1
@@ -510,6 +547,9 @@ def parse_dump_v2(source: Path | str, max_lines: int = 0):
                         artist_is_synthetic,
                         artist_name_value,
                     )
+
+                if artist_name_value:
+                    alias_to_mbid[normalize_artist_token(artist_name_value)] = artist_id
 
     summary = {
         "lines_parsed": lines,
@@ -750,9 +790,16 @@ def parse_args():
 
 def main():
     args = parse_args()
+    alias_conn = connect_postgres()
+    try:
+        alias_to_mbid = _load_alias_map_from_db(alias_conn)
+    finally:
+        alias_conn.close()
+
     track_daily, artist_daily, track_info, artist_info, summary = parse_dump_v2(
         args.dump_path,
         max_lines=args.max_lines,
+        alias_to_mbid=alias_to_mbid,
     )
 
     print_parser_details(summary)

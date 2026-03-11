@@ -23,7 +23,7 @@ import orjson
 import zstandard as zstd
 from tqdm import tqdm
 
-from artist_identity import canonicalize_artist_entities, register_artist_aliases
+from artist_identity import build_alias_map, canonicalize_artist_entities, register_artist_aliases
 
 if TYPE_CHECKING:
     import psycopg2.extensions
@@ -42,6 +42,20 @@ def _get_any(d, *keys):
         if k in d:
             return d[k]
     return None
+
+
+def _load_alias_map_from_db(conn: psycopg2.extensions.connection) -> dict[str, str]:
+    """Load known artist-name aliases from artist_info for canonical MBID reuse."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT artist_mbid, artist_name
+            FROM artist_info
+            WHERE artist_name IS NOT NULL
+            """
+        )
+        rows = cur.fetchall()
+    return build_alias_map(rows)
 
 
 def iter_listens_from_tar_zst(path: Path):
@@ -73,6 +87,7 @@ def iter_listens_from_tar_zst(path: Path):
 def parse_dump(
     source: Path | str,
     max_lines: int = 0,
+    alias_to_mbid: dict[str, str] | None = None,
 ) -> tuple[dict, dict, dict, dict, dict]:
     """
     Parse a ListenBrainz ``.tar.zst`` dump and return daily aggregates.
@@ -104,7 +119,8 @@ def parse_dump(
     missing_ts = 0
     missing_artist = 0
     synthetic_artist_mbids = 0
-    alias_to_mbid: dict[str, str] = {}
+    if alias_to_mbid is None:
+        alias_to_mbid = {}
 
     for _, line in tqdm(iter_listens_from_tar_zst(source), desc="Parsing listens"):
         lines += 1
