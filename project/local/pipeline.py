@@ -23,6 +23,8 @@ import orjson
 import zstandard as zstd
 from tqdm import tqdm
 
+from artist_identity import canonicalize_artist_entities, register_artist_aliases
+
 if TYPE_CHECKING:
     import psycopg2.extensions
 
@@ -101,6 +103,8 @@ def parse_dump(
     bad_json = 0
     missing_ts = 0
     missing_artist = 0
+    synthetic_artist_mbids = 0
+    alias_to_mbid: dict[str, str] = {}
 
     for _, line in tqdm(iter_listens_from_tar_zst(source), desc="Parsing listens"):
         lines += 1
@@ -127,28 +131,39 @@ def parse_dump(
         release_name = tm.get("release_name")
         artist_name = tm.get("artist_name")
 
-        recording_id = f"{'_'.join(artist_mbids)}_{track_name}"
+        artist_entities, synthetic_count = canonicalize_artist_entities(
+            artist_name=artist_name,
+            artist_mbids=artist_mbids,
+            alias_to_mbid=alias_to_mbid,
+        )
+        synthetic_artist_mbids += synthetic_count
+        normalized_artist_mbids = [ambid for ambid, _, _ in artist_entities]
+
+        recording_id = f"{'_'.join(normalized_artist_mbids)}_{track_name}"
 
         track_daily[(day, recording_id)] += 1
         if recording_id not in track_info:
-            track_info[recording_id] = (track_name, artist_mbids, release_name)
+            track_info[recording_id] = (track_name, normalized_artist_mbids, release_name)
 
-        if isinstance(artist_mbids, list):
-            for ambid in artist_mbids:
-                if not ambid:
-                    continue
+        if artist_entities:
+            for ambid, normalized_name, _ in artist_entities:
                 artist_daily[(day, ambid)] += 1
-                if ambid not in artist_info and artist_name:
-                    artist_info[ambid] = artist_name
+                if ambid not in artist_info and normalized_name:
+                    artist_info[ambid] = normalized_name
+                register_artist_aliases(
+                    alias_to_mbid,
+                    artist_info.get(ambid) or normalized_name,
+                    ambid,
+                )
         else:
-            if not artist_mbids:
-                missing_artist += 1
+            missing_artist += 1
 
     summary = {
         "lines_parsed": lines,
         "bad_json": bad_json,
         "missing_timestamp": missing_ts,
         "missing_artist_mbid": missing_artist,
+        "synthetic_artist_mbids": synthetic_artist_mbids,
         "unique_track_day_keys": len(track_daily),
         "unique_artist_day_keys": len(artist_daily),
         "unique_tracks": len({k[1] for k in track_daily}),
@@ -229,8 +244,8 @@ def upsert_aggregates(
                 INSERT INTO artist_info (artist_mbid, artist_name)
                 VALUES %s
                 ON CONFLICT (artist_mbid) DO UPDATE
-                  SET artist_name = COALESCE(EXCLUDED.artist_name,
-                                             artist_info.artist_name)
+                  SET artist_name = COALESCE(artist_info.artist_name,
+                                             EXCLUDED.artist_name)
                 """,
                 batch,
             )
