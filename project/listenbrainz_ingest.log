@@ -1,6 +1,0 @@
-2026-03-07 21:49:24,036 - INFO - ================================================================================
-2026-03-07 21:49:24,036 - INFO - Starting ListenBrainz Local -> AWS Ingestion Pipeline
-2026-03-07 21:49:24,036 - INFO - ================================================================================
-2026-03-07 21:49:24,036 - INFO - S3_BUCKET=stall-munezero-final-project
-2026-03-07 21:49:24,036 - INFO - S3_DUMP_KEY=listenbrainz/incremental/listenbrainz-listens-dump-2400-20260118-000003-incremental.tar.zst
-2026-03-07 21:49:24,054 - INFO - Found credentials in shared credentials file: ~/.aws/credentials

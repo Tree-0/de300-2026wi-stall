@@ -1,3 +1,9 @@
+"""
+One-time migration to clean and remap artist identities in existing DB tables.
+Migration design decisions made by project team.
+File generated with Copilot.
+"""
+
 from __future__ import annotations
 
 import argparse
