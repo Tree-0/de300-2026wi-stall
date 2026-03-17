@@ -375,9 +375,18 @@ def ensure_tables(conn: psycopg2.extensions.connection) -> None:
         cur.execute(ddl)
 
 
-def parse_dump(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[str, str] | None = None):
+def parse_dump(
+    source: Path | str,
+    max_lines: int = 0,
+    alias_to_mbid: dict[str, str] | None = None,
+    min_date_to_ingest: str | None = None,
+):
     """
     Parse one dump with canonical-first track identity logic.
+
+    When min_date_to_ingest is set (e.g. "2026-01-01"), daily listen rows with
+    day < that date are excluded from track_daily/artist_daily but track_info
+    and artist_info are still updated so the entity catalog stays complete.
 
     Returns:
       track_daily: dict[(day, recording_id), int]
@@ -400,6 +409,7 @@ def parse_dump(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[str, 
     bad_json = 0
     missing_ts = 0
     usable_rows = 0
+    daily_listens_excluded_before_cutoff = 0
 
     artist_mbids_missing_key = 0
     artist_mbids_empty_list = 0
@@ -440,6 +450,9 @@ def parse_dump(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[str, 
         usable_rows += 1
 
         day = day_from_unix(int(ts))
+        skip_daily = min_date_to_ingest is not None and day < min_date_to_ingest
+        if skip_daily:
+            daily_listens_excluded_before_cutoff += 1
         tm = rec.get("track_metadata") or {}
         add = tm.get("additional_info") or {}
 
@@ -503,7 +516,8 @@ def parse_dump(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[str, 
             else:
                 used_recording_mbid += 1
 
-            track_daily[(day, recording_id)] += 1
+            if not skip_daily:
+                track_daily[(day, recording_id)] += 1
 
             if recording_id not in track_info:
                 track_info[recording_id] = (
@@ -526,8 +540,9 @@ def parse_dump(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[str, 
                 used_artist_fallback_rows += 1
 
             for artist_id, artist_mbid, artist_fallback_key, artist_is_synthetic, artist_name_value in artist_identities:
-                artist_daily[(day, artist_id)] += 1
-                generated_artist_daily_rows += 1
+                if not skip_daily:
+                    artist_daily[(day, artist_id)] += 1
+                    generated_artist_daily_rows += 1
                 if artist_id not in artist_info:
                     artist_info[artist_id] = (
                         artist_mbid,
@@ -572,6 +587,7 @@ def parse_dump(source: Path | str, max_lines: int = 0, alias_to_mbid: dict[str, 
         "unique_artist_day_keys": len(artist_daily),
         "unique_tracks": len({key[1] for key in track_daily.keys()}),
         "unique_artists": len({key[1] for key in artist_daily.keys()}),
+        "daily_listens_excluded_before_cutoff": daily_listens_excluded_before_cutoff,
     }
 
     return track_daily, artist_daily, track_info, artist_info, summary
@@ -600,6 +616,9 @@ def print_parser_details(summary: dict) -> None:
     print(f"  bad_json:                {summary['bad_json']:,}")
     print(f"  missing_timestamp:       {summary['missing_timestamp']:,}")
     print(f"  dropped_no_artist_signals:{summary['dropped_rows_missing_artist_signals']:,} ({_pct(summary['dropped_rows_missing_artist_signals'], usable):6.2f}%)")
+    excluded_cutoff = summary.get("daily_listens_excluded_before_cutoff", 0)
+    if excluded_cutoff:
+        print(f"  daily_listens_excluded_before_cutoff:{excluded_cutoff:,} ({_pct(excluded_cutoff, usable):6.2f}%)")
     print()
 
     print("TRACK IDENTITY")

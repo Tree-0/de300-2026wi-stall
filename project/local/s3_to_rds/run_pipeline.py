@@ -14,14 +14,14 @@ if str(PROJECT_LOCAL_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_LOCAL_DIR))
 
 from pipeline import _compute_entity_stats
-from pipeline_recording_id_v2 import (  # noqa: E402
+from pipeline_recording_id import (
     _load_alias_map_from_db,
     ensure_tables,
     parse_dump,
     print_parser_details,
     upsert,
 )
-from utils import (  # noqa: E402
+from utils import (
     connect_postgres,
     download_s3_dump,
     get_s3_client,
@@ -62,6 +62,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Optional parse cap for debugging; 0 means full dump.",
+    )
+    parser.add_argument(
+        "--min-date-to-ingest",
+        type=str,
+        default=None,
+        metavar="YYYY-MM-DD",
+        help="Only ingest daily listens with day >= this date (ISO). Omit to ingest all.",
     )
     parser.add_argument(
         "--skip-stats",
@@ -174,7 +181,10 @@ def ensure_ingestion_state(conn) -> None:
 
 def get_last_dump_id(conn) -> int:
     with conn.cursor() as cur:
-        cur.execute("SELECT COALESCE(last_dump_id, 0) FROM ingestion_state WHERE id = 1")
+        cur.execute(
+            "SELECT COALESCE(NULLIF(last_dump_id, '')::bigint, 0) "
+            "FROM ingestion_state WHERE id = 1"
+        )
         row = cur.fetchone()
     return int(row[0] or 0) if row else 0
 
@@ -222,7 +232,7 @@ def cleanup_local_file(path: Path, keep_temp_files: bool) -> None:
         print(f"Removed empty dir: {parent}")
 
 
-def refresh_daily_stats_v2(conn_params: dict[str, str | int], entity: str, spark_driver_memory: str) -> None:
+def refresh_daily_stats(conn_params: dict[str, str | int], entity: str, spark_driver_memory: str) -> None:
     if os.name == "nt":
         hadoop_home = Path.home() / ".hadoop"
         (hadoop_home / "bin").mkdir(parents=True, exist_ok=True)
@@ -333,6 +343,7 @@ def ingest_next_n_dumps(args: argparse.Namespace, conn_params: dict[str, str | i
                     local_path,
                     max_lines=args.max_lines,
                     alias_to_mbid=alias_to_mbid,
+                    min_date_to_ingest=args.min_date_to_ingest,
                 )
                 print_parser_details(summary)
                 total_rows_parsed += int(summary.get("lines_parsed", 0))
@@ -361,7 +372,7 @@ def ingest_next_n_dumps(args: argparse.Namespace, conn_params: dict[str, str | i
 
     if dump_ids and not args.skip_stats:
         print(f"\nRefreshing v2 stats tables for entity='{args.stats_entity}'...")
-        refresh_daily_stats_v2(conn_params, entity=args.stats_entity, spark_driver_memory=args.spark_driver_memory)
+        refresh_daily_stats(conn_params, entity=args.stats_entity, spark_driver_memory=args.spark_driver_memory)
 
     return {
         "start_after_dump_id": start_after_dump_id,
