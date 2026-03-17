@@ -95,18 +95,23 @@ def main() -> None:
     conn = connect_postgres(conn_params)
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT count(*) FROM artist_daily_listens WHERE day < %s", (args.before_date,))
-            #artist_deleted = cur.rowcount
-            artist_deleted = cur.fetchone()[0]
-            cur.execute("SELECT count(*)FROM track_daily_listens WHERE day < %s", (args.before_date,))
-            #track_deleted = cur.rowcount
-            track_deleted = cur.fetchone()[0]
+            cur.execute("DELETE FROM artist_daily_listens WHERE day < %s", (args.before_date,))
+            artist_deleted = cur.rowcount
+            #artist_deleted = cur.fetchone()[0]
+            cur.execute("DELETE FROM track_daily_listens WHERE day < %s", (args.before_date,))
+            track_deleted = cur.rowcount
+            #track_deleted = cur.fetchone()[0]
+            cur.execute("DELETE FROM artist_daily_stats WHERE day < %s", (args.before_date,))
+            artist_stats_deleted = cur.rowcount
+            cur.execute("DELETE FROM track_daily_stats WHERE day < %s", (args.before_date,))
+            track_stats_deleted = cur.rowcount
         conn.commit()
         print(f"Deleted {artist_deleted:,} rows from artist_daily_listens.")
         print(f"Deleted {track_deleted:,} rows from track_daily_listens.")
+        print(f"Deleted {artist_stats_deleted:,} rows from artist_daily_stats.")
+        print(f"Deleted {track_stats_deleted:,} rows from track_daily_stats.")
     finally:
         conn.close()
-
 
 if __name__ == "__main__":
     main()
