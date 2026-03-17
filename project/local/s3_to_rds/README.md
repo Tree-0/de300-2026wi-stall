@@ -5,7 +5,7 @@ This folder contains a server-run batch ingester that combines:
 - S3 dump discovery and progress tracking from the notebook / older pipeline flow
 - v2 canonical/fallback cleaning and upsert logic from `pipeline_recording_id_v2.py`
 - `dump_id` provenance in daily listen tables
-- automatic refresh of `artist_daily_stats` and `track_daily_stats`
+- optional refresh of `artist_daily_stats` and `track_daily_stats`
 
 ## What it does
 
@@ -22,7 +22,7 @@ When you run the pipeline, it will:
    - `artist_daily_listens`
    - `track_daily_listens`
 7. Update `ingestion_state`
-8. Recompute:
+8. (Optional) recompute:
    - `artist_daily_stats`
    - `track_daily_stats`
 
@@ -109,6 +109,24 @@ Ingest the next 5 dumps but skip stats refresh:
 ```bash
 python run_pipeline.py --n-dumps 5 --skip-stats
 ```
+
+## Stats refresh (SQL-only, windowed)
+
+`project/local/refresh_daily_stats.py` now performs a SQL-only, *windowed* refresh
+of the stats tables (no Spark). By default it recomputes only the most recent
+14 days (based on `MAX(day)` in each listens table) and replaces only that date
+range in `*_daily_stats`.
+
+Run (recommended after ingest, or on a schedule):
+
+```bash
+python project/local/refresh_daily_stats.py --entity both --window-days 14
+```
+
+Notes:
+- This keeps historical stats rows older than the window intact.
+- The refresh reads a 30-day lookback of listens to make rolling 30-day sums
+  correct inside the output window.
 
 Start after a specific dump id instead of using `ingestion_state`:
 
