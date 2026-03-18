@@ -59,6 +59,7 @@ ssh -i "path/to/your-key.pem" \
   ec2-user@98.89.230.64
 ```
 
+- Change the pem key path to your specific key. If you need our pem key (or any other key/certificate) for testing, please email `nathanielstall2027@u.northwestern.edu`.
 - Keep this SSH session open while you run the pipeline.
 - In this configuration, set `PGHOST=127.0.0.1` and `PGPORT=5433` in your `.env`.
 
